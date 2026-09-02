@@ -1,6 +1,6 @@
 {
   "name": "pi-cruise-control",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Pi package that auto-approves or denies tool calls with an LLM classifier scoring risk and user intent, with caching, audit logging, and session stats.",
   "keywords": [
     "pi-coding-agent",

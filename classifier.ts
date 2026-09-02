@@ -1,5 +1,5 @@
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CruiseControlConfig, Instructions } from "./config";
 import { type Classification, type ClassificationRequest, isLevel } from "./types";
@@ -45,6 +45,51 @@ export class ClassifierError extends Error {
 }
 
 /**
+ * Models that answered one classification attempt with a temperature rejection,
+ * remembered for the process lifetime. Only the first call against such a model
+ * pays for the failed request; later calls omit the parameter from the start.
+ */
+const temperatureRejected = new Set<string>();
+
+function modelKey(model: Model<Api>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+/** Read `compat.supportsTemperature` without fighting the conditional `compat` union on `Model<Api>`. */
+function compatSupportsTemperature(model: Model<Api>): boolean | undefined {
+  const compat = model.compat as { supportsTemperature?: boolean } | undefined;
+  return compat?.supportsTemperature;
+}
+
+/**
+ * Whether `temperature: 0` should be sent for this model.
+ *
+ * Not every backend accepts it:
+ * - the ChatGPT Codex backend (`openai-codex-responses`) rejects the parameter
+ *   outright with HTTP 400, and nothing in its model metadata says so;
+ * - Claude Opus 4.7+ deprecated the parameter, and pi flags those models
+ *   `compat.supportsTemperature: false`. That flag exists only on the anthropic
+ *   compat type, so this check fires just for anthropic-messages models —
+ *   defense-in-depth on top of pi-ai's own gating. Claude behind an
+ *   OpenAI-compatible proxy carries no flag and is covered by the reactive
+ *   fallback below instead.
+ *
+ * Anything else gets the parameter once — if the endpoint complains, the call is
+ * retried without it and the model is remembered.
+ */
+function shouldSendTemperature(model: Model<Api>): boolean {
+  if (temperatureRejected.has(modelKey(model))) return false;
+  if (model.api === "openai-codex-responses") return false;
+  if (compatSupportsTemperature(model) === false) return false;
+  return true;
+}
+
+/** Every known temperature rejection names the parameter in its error text. */
+function isTemperatureError(error: string): boolean {
+  return /temperature/i.test(error);
+}
+
+/**
  * Ask the configured model to rate one tool call.
  *
  * Rejects with `ClassifierError` when no model resolves, auth is missing, the call
@@ -73,9 +118,12 @@ export async function classify(
     timestamp: Date.now(),
   };
 
-  let response: Awaited<ReturnType<typeof completeSimple>>;
-  try {
-    response = await completeSimple(
+  // `temperature: 0` favors consistent verdicts, but a model that rejects the
+  // parameter rejects it on every attempt, so a plain retry loop can never
+  // succeed against it — without this fallback every classification on such a
+  // backend fails and the gate runs on its `onError` policy alone.
+  const requestOnce = (temperature?: number) =>
+    completeSimple(
       model,
       { systemPrompt: buildSystemPrompt(config.instructions), messages: [message] },
       {
@@ -83,18 +131,21 @@ export async function classify(
         headers: auth.headers,
         env: auth.env,
         reasoning: config.reasoning,
-        temperature: 0,
+        temperature,
         signal,
       },
     );
-  } catch (error) {
-    throw new ClassifierError(error instanceof Error ? error.message : String(error), true);
-  }
 
-  if (response.stopReason === "aborted") throw new ClassifierError("classification aborted", true);
-  if (response.stopReason === "error") {
-    throw new ClassifierError(response.errorMessage ?? "classifier request failed", true);
+  const withTemperature = shouldSendTemperature(model);
+  let outcome = await attempt(requestOnce, withTemperature);
+  if (!outcome.ok && withTemperature && !signal.aborted && isTemperatureError(outcome.error)) {
+    temperatureRejected.add(modelKey(model));
+    outcome = await attempt(requestOnce, false);
   }
+  if (!outcome.ok) throw new ClassifierError(outcome.error, true);
+
+  const response = outcome.message;
+  if (response.stopReason === "aborted") throw new ClassifierError("classification aborted", true);
 
   const text = response.content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -116,6 +167,26 @@ export function resolveModel(config: CruiseControlConfig, ctx: ExtensionContext)
   const provider = config.model.slice(0, separator);
   const modelId = config.model.slice(separator + 1);
   return ctx.modelRegistry.find(provider, modelId) ?? undefined;
+}
+
+/**
+ * One classification attempt. Endpoint faults surface two ways depending on the
+ * API — a thrown error, or a response with an `error` stop reason — so both are
+ * folded into a failure string; everything else comes back as the response.
+ */
+async function attempt(
+  request: (temperature?: number) => Promise<AssistantMessage>,
+  withTemperature: boolean,
+): Promise<{ ok: true; message: AssistantMessage } | { ok: false; error: string }> {
+  try {
+    const message = await request(withTemperature ? 0 : undefined);
+    if (message.stopReason === "error") {
+      return { ok: false, error: message.errorMessage ?? "classifier request failed" };
+    }
+    return { ok: true, message };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function buildSystemPrompt(instructions: Instructions): string {
