@@ -67,9 +67,12 @@ function compatSupportsTemperature(model: Model<Api>): boolean | undefined {
  * Not every backend accepts it:
  * - the ChatGPT Codex backend (`openai-codex-responses`) rejects the parameter
  *   outright with HTTP 400, and nothing in its model metadata says so;
- * - Anthropic models that deprecated the parameter (Claude Opus 4.7+) are
- *   flagged `compat.supportsTemperature: false`; checked here because only
- *   the anthropic API layer honors the flag, not custom OpenAI-compatible providers.
+ * - Claude Opus 4.7+ deprecated the parameter, and pi flags those models
+ *   `compat.supportsTemperature: false`. That flag exists only on the anthropic
+ *   compat type, so this check fires just for anthropic-messages models —
+ *   defense-in-depth on top of pi-ai's own gating. Claude behind an
+ *   OpenAI-compatible proxy carries no flag and is covered by the reactive
+ *   fallback below instead.
  *
  * Anything else gets the parameter once — if the endpoint complains, the call is
  * retried without it and the model is remembered.
